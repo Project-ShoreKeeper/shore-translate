@@ -123,8 +123,12 @@ class WhisperASR:
 
         self.ja_terms = load_glossary_terms()
         self.initial_prompt = build_initial_prompt(self.ja_terms)
-        self.hotwords = " ".join(self.ja_terms) if self.ja_terms else None
-        print(f"[asr] Loaded {len(self.ja_terms)} glossary terms for initial_prompt/hotwords.")
+        # Avoid hotwords buffer overflow on distilled models (e.g. Kotoba) where initial_prompt suffices
+        if "kotoba" in model_name.lower():
+            self.hotwords = None
+        else:
+            self.hotwords = " ".join(self.ja_terms[:15]) if self.ja_terms else None
+        print(f"[asr] Loaded {len(self.ja_terms)} glossary terms (initial_prompt active, hotwords={'enabled' if self.hotwords else 'disabled'}).")
 
     def transcribe_segment(self, audio_data: np.ndarray) -> Optional[Tuple[str, float]]:
         """

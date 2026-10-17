@@ -27,10 +27,10 @@ MIN_DRAFT_AUDIO_SEC = 0.65        # Require at least 0.65s audio before emitting
 
 # ASR settings (faster-whisper)
 # Options:
-# - "large-v3": Maximum accuracy (32 decoder layers)
-# - "kotoba-tech/kotoba-whisper-v2.0-faster": Japanese distil model, ultra fast (4 decoder layers)
+# - "kotoba-tech/kotoba-whisper-v2.0-faster": Japanese distil model, ultra fast (4 decoder layers, default)
 # - "deepdml/faster-whisper-large-v3-turbo-ct2": Whisper Turbo, 3-4x faster than large-v3
-ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "large-v3")
+# - "large-v3": Maximum accuracy (32 decoder layers)
+ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "kotoba-tech/kotoba-whisper-v2.0-faster")
 ASR_DEVICE = "cuda"
 ASR_COMPUTE_TYPE = "float16"
 ASR_LANGUAGE = "ja"
