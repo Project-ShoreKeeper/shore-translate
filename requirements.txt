@@ -1,0 +1,7 @@
+soundcard
+onnxruntime
+faster-whisper
+PySide6
+numpy
+scipy
+soundfile
