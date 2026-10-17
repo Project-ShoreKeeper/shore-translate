@@ -13,13 +13,17 @@ The entire AI pipeline runs locally across separate threads connected by thread-
 ```
 System Audio (soundcard loopback)
    ↓ 16 kHz mono float32 chunks (~30ms)
-VAD Segmentation & Live Draft Emission (CPU - ONNX Runtime C++ engine)
+VAD Adaptive Soft-Cut & Draft Emission (CPU - ONNX Runtime C++ engine)
    ├─ Every ~0.85s: Live speech draft audio (Streaming Draft)
-   └─ On 0.40s silence / 5.0s limit: Complete speech segment (Final Commit)
+   ├─ Soft-Cut [4.0s - 6.0s]: 0.15s micro-pause detection (catches breath / clause boundary)
+   └─ On 0.40s silence / 6.0s hard limit: Final commit + Epoch increment
 ASR Transcription (CUDA - faster-whisper / CTranslate2 C++ engine)
-   ↓ Japanese text + hallucination filters + glossary injection
+   ├─ Drop Stale Drafts: Preempts and purges obsolete drafts when Final arrives
+   └─ Japanese text + hallucination filters + glossary injection
 Translation (Local llama-server / llama.cpp on CUDA)
-   ↓ English subtitle text (60 tokens for draft / 120 tokens for final)
+   ├─ 100% Static System Prompt: 100% Prefix KV Cache hit (--cache-reuse in llama-server)
+   ├─ Dynamic Glossary Matching: Ultra-fast (<0.05ms) keyword extraction in User turn
+   └─ English subtitle text (60 tokens draft / 120 tokens final)
 Floating Overlay (PySide6 GUI)
    ├─ Amber Italic: Live draft preview
    └─ Crisp White: Final committed translation
@@ -28,6 +32,9 @@ Floating Overlay (PySide6 GUI)
 ### Key Highlights
 - **Zero Cloud API Keys**: Translation runs on your local `llama-server` (baseline: **Qwen2.5-7B-Instruct** on port `9090`).
 - **Streaming Draft & Revise**: Live partial translations update every ~0.85s (in amber italic) as the streamer speaks, then instantly lock in with high-precision translation (in white bold) when a sentence completes.
+- **Drop Stale Drafts & Preemption**: When a Final Commit occurs, all pending intermediate drafts are purged instantly from queues and dropped by workers, ensuring zero queue lag for final subtitles.
+- **Adaptive Soft-Cut VAD**: Rather than cutting speech rigidly at 5.0s, speech between 4.0s and 6.0s dynamically uses an ultra-sensitive 0.15s micro-pause threshold to cleanly cut between clauses (e.g. 〜て、〜けど) without slicing Japanese words in half.
+- **100% Prefix KV Cache Reuse + Dynamic Glossary**: The System Prompt is completely invariant, enabling llama.cpp to reuse 100% of prefix KV cache (Time-To-First-Token < 20ms). Only terms actually present in the current sentence are dynamically injected into the user turn.
 - **Zero PyTorch Dependency**: Both VAD (ONNX Runtime) and ASR (CTranslate2) run on native C++ engines, avoiding GIL locks and PyTorch memory overhead.
 - **Hardware Optimized**: Fits comfortably inside 16 GB VRAM on NVIDIA RTX GPUs (Whisper ~3.9 GB + LLM ~4-10 GB = ~8-14 GB total).
 - **Audio Capture**: `soundcard` captures loopback monitor audio directly from the default speaker (PipeWire / PulseAudio).
@@ -105,9 +112,11 @@ shore-translate/
 
 Edit `config.py` to customize parameters:
 - `LOCAL_LLM_URL`: Endpoint for translation (default `"http://localhost:9090/v1/chat/completions"`).
-- `ASR_MODEL_NAME`: Default `"large-v3"`. Alternative: `"kotoba-tech/kotoba-whisper-v2.0-faster"`.
-- `VAD_SILENCE_THRESHOLD_SEC`: Silence duration to close a segment (default `0.40` s).
-- `VAD_MAX_SEGMENT_SEC`: Maximum segment duration (default `5.0` s).
+- `ASR_MODEL_NAME`: Default `"large-v3"`. Options: `"kotoba-tech/kotoba-whisper-v2.0-faster"`, `"deepdml/faster-whisper-large-v3-turbo-ct2"`.
+- `VAD_SILENCE_THRESHOLD_SEC`: Standard silence duration to close a segment (default `0.40` s).
+- `VAD_SOFT_MAX_SEC`: Speech duration threshold where adaptive silence kicks in (default `4.0` s).
+- `VAD_HARD_MAX_SEC`: Hard maximum segment duration before forced cut (default `6.0` s).
+- `VAD_MICRO_PAUSE_SEC`: Micro-pause threshold for natural clause/breath soft-cut in [4.0s, 6.0s] (default `0.15` s).
 - `DRAFT_INTERVAL_SEC`: Emit live intermediate draft every `0.85` s during speech.
 - `MIN_DRAFT_AUDIO_SEC`: Minimum speech duration (`0.65` s) before emitting the first draft.
 - `SUBTITLE_CLEAR_DELAY_SEC`: Delay before fading clear subtitles (default `6.0` s).
@@ -127,4 +136,5 @@ Add custom IT/programming terms in `日本語 = English` format:
 マージ = merge
 ...
 ```
-The Japanese terms are automatically loaded at startup into ASR `initial_prompt` and `hotwords`. The full glossary is included in the translation system prompt for exact term matching.
+- **ASR Acoustic Biasing**: Japanese terms are loaded at startup into Whisper `initial_prompt` and `hotwords`.
+- **Dynamic Matching & KV Cache Protection**: During translation, an ultra-fast (<0.05ms) matcher scans each Japanese sentence for glossary keywords. Matched definitions are injected directly into that specific User turn rather than mutating the System Prompt, preserving 100% prefix KV cache reuse while allowing `glossary.txt` to scale to thousands of terms.

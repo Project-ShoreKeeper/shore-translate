@@ -191,10 +191,14 @@ def run_asr_worker(
 ) -> None:
     """
     Worker thread: reads speech segments from speech_queue, runs ASR,
-    and puts (text, latency_sec, audio_duration_sec, is_final) into transcript_queue.
-    Drains older intermediate drafts if newer speech chunks are waiting.
+    and puts (epoch_id, text, latency_sec, audio_duration_sec, is_final) into transcript_queue.
+    Features:
+    - Preemption / Drop Stale Drafts:
+      If a final commit is pending or arrives, all previous drafts are instantly purged.
+      If multiple drafts are queued, older drafts are dropped in favor of the latest draft.
     """
     asr = WhisperASR()
+    committed_epoch = -1
 
     while not stop_event.is_set():
         try:
@@ -202,21 +206,66 @@ def run_asr_worker(
         except queue.Empty:
             continue
 
-        # Drain obsolete draft items if newer items are available
-        latest_item = item
+        # Drain and inspect any additional pending items
+        pending_items = [item]
         while not speech_queue.empty():
             try:
-                peek = speech_queue.get_nowait()
-                latest_item = peek
-                if peek[2]:  # If is_final is True, prioritize and stop draining
-                    break
+                pending_items.append(speech_queue.get_nowait())
             except queue.Empty:
                 break
 
-        audio_data, audio_duration, is_final = latest_item
+        # Check if there is any final commit among pending items
+        final_item = None
+        for it in reversed(pending_items):
+            is_fin = it[3] if len(it) == 4 else it[2]
+            if is_fin:
+                final_item = it
+                break
+
+        if final_item is not None:
+            # Drop all stale drafts and prioritize the Final commit immediately
+            chosen_item = final_item
+        else:
+            # Keep only the latest intermediate draft
+            chosen_item = pending_items[-1]
+
+        if len(chosen_item) == 4:
+            epoch_id, audio_data, audio_duration, is_final = chosen_item
+        else:
+            epoch_id = 0
+            audio_data, audio_duration, is_final = chosen_item
+
+        # If it's a draft belonging to an already committed or older epoch, skip without computing
+        if not is_final and epoch_id <= committed_epoch:
+            continue
+
         result = asr.transcribe_segment(audio_data)
         if result is not None:
             text, latency = result
+
+            # If this was a draft, check if a Final item has arrived in the meantime
+            if not is_final and not speech_queue.empty():
+                has_final = False
+                temp_items = []
+                while not speech_queue.empty():
+                    try:
+                        temp = speech_queue.get_nowait()
+                        temp_items.append(temp)
+                        if (temp[3] if len(temp) == 4 else temp[2]):
+                            has_final = True
+                    except queue.Empty:
+                        break
+                for t in temp_items:
+                    speech_queue.put(t)
+
+                if has_final:
+                    # Drop this stale draft transcript, do not forward to translation
+                    continue
+
             tag = "FINAL" if is_final else "DRAFT"
-            print(f"[ASR {tag}] ({audio_duration:.2f}s audio | {latency:.2f}s latency): {text}")
-            transcript_queue.put((text, latency, audio_duration, is_final))
+            print(f"[ASR {tag}] (epoch {epoch_id} | {audio_duration:.2f}s audio | {latency:.2f}s latency): {text}")
+            transcript_queue.put((epoch_id, text, latency, audio_duration, is_final))
+
+            if is_final:
+                committed_epoch = max(committed_epoch, epoch_id)
+

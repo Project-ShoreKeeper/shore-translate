@@ -8,7 +8,9 @@ import faster_whisper.vad as vad_module
 from config import (
     SAMPLE_RATE,
     VAD_SILENCE_THRESHOLD_SEC,
-    VAD_MAX_SEGMENT_SEC,
+    VAD_SOFT_MAX_SEC,
+    VAD_HARD_MAX_SEC,
+    VAD_MICRO_PAUSE_SEC,
     VAD_PADDING_SEC,
     VAD_THRESHOLD,
     VAD_MIN_SEGMENT_SEC,
@@ -19,35 +21,45 @@ from config import (
 # Silero VAD v6 parameters
 WINDOW_SIZE_SAMPLES = 512  # 32ms at 16kHz
 CONTEXT_SIZE_SAMPLES = 64  # 4ms context
-PADDING_SAMPLES = int(SAMPLE_RATE * VAD_PADDING_SEC)  # ~3200 samples (0.2s)
-SILENCE_THRESHOLD_SAMPLES = int(SAMPLE_RATE * VAD_SILENCE_THRESHOLD_SEC)  # ~9600 samples (0.6s)
-MAX_SEGMENT_SAMPLES = int(SAMPLE_RATE * VAD_MAX_SEGMENT_SEC)  # ~128000 samples (8.0s)
+PADDING_SAMPLES = int(SAMPLE_RATE * VAD_PADDING_SEC)
 
 
 class VADSegmenter:
     """
     Streaming Silero VAD segmenter running on CPU via ONNX Runtime (C++ engine).
-    Receives raw 16kHz audio chunks, groups speech into segments with pre/post padding,
-    emits live intermediate drafts during speech (Option B), and closes segments on silence or max duration limit.
+    Features:
+    - Pre/post speech padding buffers
+    - Progressive live draft emission every ~0.85s (Option B Streaming Draft)
+    - Adaptive Soft-Cut between 4.0s and 6.0s: lowers silence threshold to 0.15s
+      to catch natural breathing / clause micro-pauses (〜て、〜けど、)
+    - Hard ceiling cut at 6.0s
+    - Epoch ID tracking for instantaneous stale-draft preemption
     """
 
     def __init__(
         self,
         sample_rate: int = SAMPLE_RATE,
-        silence_threshold_samples: int = SILENCE_THRESHOLD_SAMPLES,
-        max_segment_samples: int = MAX_SEGMENT_SAMPLES,
+        silence_threshold_sec: float = VAD_SILENCE_THRESHOLD_SEC,
+        soft_max_sec: float = VAD_SOFT_MAX_SEC,
+        hard_max_sec: float = VAD_HARD_MAX_SEC,
+        micro_pause_sec: float = VAD_MICRO_PAUSE_SEC,
         padding_samples: int = PADDING_SAMPLES,
         vad_threshold: float = VAD_THRESHOLD,
     ):
         self.sample_rate = sample_rate
-        self.silence_threshold_samples = silence_threshold_samples
-        self.max_segment_samples = max_segment_samples
+        self.silence_threshold_samples = int(sample_rate * silence_threshold_sec)
+        self.soft_max_samples = int(sample_rate * soft_max_sec)
+        self.hard_max_samples = int(sample_rate * hard_max_sec)
+        self.micro_pause_samples = int(sample_rate * micro_pause_sec)
         self.padding_samples = padding_samples
         self.vad_threshold = vad_threshold
         self.draft_interval_samples = int(sample_rate * DRAFT_INTERVAL_SEC)
         self.min_draft_samples = int(sample_rate * MIN_DRAFT_AUDIO_SEC)
 
-        # Load Silero VAD ONNX model (runs on CPU via ONNX Runtime)
+        # Monotonically increasing epoch sequence counter
+        self.epoch_id = 0
+
+        # Load Silero VAD ONNX model (CPU ONNX Runtime)
         self.vad_model = vad_module.get_vad_model()
         self.reset_states()
 
@@ -73,10 +85,10 @@ class VADSegmenter:
         )
         return float(out[0][0]) if out.ndim > 1 else float(out[0])
 
-    def process_samples(self, samples: np.ndarray) -> list[tuple[np.ndarray, float, bool]]:
+    def process_samples(self, samples: np.ndarray) -> list[tuple[int, np.ndarray, float, bool]]:
         """
         Process incoming audio samples and return any closed segments as
-        (segment_audio_float32, duration_sec, is_final).
+        (epoch_id, segment_audio_float32, duration_sec, is_final).
         If is_final=False, it is a progressive live draft during active speech.
         """
         if len(samples) == 0:
@@ -107,18 +119,20 @@ class VADSegmenter:
                 self.samples_since_last_draft += len(frame)
                 self.consecutive_silence_samples = 0
 
-                # Check max length constraint (final commit)
-                if self.current_segment_samples >= self.max_segment_samples:
+                # 1. Hard ceiling constraint (forced final cut at 6.0s)
+                if self.current_segment_samples >= self.hard_max_samples:
                     seg_audio = np.concatenate(self.current_segment).astype(np.float32)
-                    closed_segments.append((seg_audio, len(seg_audio) / self.sample_rate, True))
+                    closed_segments.append((self.epoch_id, seg_audio, len(seg_audio) / self.sample_rate, True))
+                    self.epoch_id += 1
                     self.reset_states()
-                # Check draft interval (live intermediate draft)
+
+                # 2. Live intermediate draft interval check
                 elif (
                     self.current_segment_samples >= self.min_draft_samples
                     and self.samples_since_last_draft >= self.draft_interval_samples
                 ):
                     draft_audio = np.concatenate(self.current_segment).astype(np.float32)
-                    closed_segments.append((draft_audio, len(draft_audio) / self.sample_rate, False))
+                    closed_segments.append((self.epoch_id, draft_audio, len(draft_audio) / self.sample_rate, False))
                     self.samples_since_last_draft = 0
 
             else:
@@ -129,22 +143,33 @@ class VADSegmenter:
                     self.samples_since_last_draft += len(frame)
                     self.consecutive_silence_samples += len(frame)
 
-                    # Check silence threshold (final commit)
-                    if self.consecutive_silence_samples >= self.silence_threshold_samples:
+                    # Adaptive Soft-Cut threshold calculation:
+                    # If speech duration reached soft_max (4.0s), require only micro_pause (0.15s)
+                    # of silence to catch natural breathing / clause boundary without cutting words.
+                    if self.current_segment_samples >= self.soft_max_samples:
+                        required_silence = self.micro_pause_samples
+                    else:
+                        required_silence = self.silence_threshold_samples
+
+                    # 1. Check silence threshold (Soft-Cut or standard silence)
+                    if self.consecutive_silence_samples >= required_silence:
                         excess_silence = self.consecutive_silence_samples - self.padding_samples
                         seg_audio = np.concatenate(self.current_segment).astype(np.float32)
                         if excess_silence > 0 and len(seg_audio) > excess_silence:
                             seg_audio = seg_audio[:-excess_silence]
 
                         duration = len(seg_audio) / self.sample_rate
-                        # Keep only segments of meaningful duration
                         if duration >= VAD_MIN_SEGMENT_SEC:
-                            closed_segments.append((seg_audio, duration, True))
+                            closed_segments.append((self.epoch_id, seg_audio, duration, True))
+                            self.epoch_id += 1
 
                         self.reset_states()
-                    elif self.current_segment_samples >= self.max_segment_samples:
+
+                    # 2. Check hard max ceiling
+                    elif self.current_segment_samples >= self.hard_max_samples:
                         seg_audio = np.concatenate(self.current_segment).astype(np.float32)
-                        closed_segments.append((seg_audio, len(seg_audio) / self.sample_rate, True))
+                        closed_segments.append((self.epoch_id, seg_audio, len(seg_audio) / self.sample_rate, True))
+                        self.epoch_id += 1
                         self.reset_states()
                 else:
                     # Maintain rolling pre-speech buffer
@@ -156,14 +181,15 @@ class VADSegmenter:
 
         return closed_segments
 
-    def flush(self) -> list[tuple[np.ndarray, float, bool]]:
+    def flush(self) -> list[tuple[int, np.ndarray, float, bool]]:
         """Flush any currently ongoing speech segment."""
         closed_segments = []
         if self.is_speech and len(self.current_segment) > 0:
             seg_audio = np.concatenate(self.current_segment).astype(np.float32)
             duration = len(seg_audio) / self.sample_rate
             if duration >= VAD_MIN_SEGMENT_SEC:
-                closed_segments.append((seg_audio, duration, True))
+                closed_segments.append((self.epoch_id, seg_audio, duration, True))
+                self.epoch_id += 1
         self.reset_states()
         return closed_segments
 
@@ -175,7 +201,7 @@ def run_vad_worker(
 ) -> None:
     """
     Worker thread: reads raw audio from audio_queue, applies VAD,
-    and pushes speech segments (np.ndarray float32, duration_sec, is_final) into speech_queue.
+    and pushes speech segments (epoch_id, np.ndarray float32, duration_sec, is_final) into speech_queue.
     """
     segmenter = VADSegmenter()
 
@@ -186,5 +212,5 @@ def run_vad_worker(
             continue
 
         segments = segmenter.process_samples(chunk)
-        for seg_audio, duration, is_final in segments:
-            speech_queue.put((seg_audio, duration, is_final))
+        for epoch_id, seg_audio, duration, is_final in segments:
+            speech_queue.put((epoch_id, seg_audio, duration, is_final))

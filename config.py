@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 # Paths
@@ -11,10 +12,12 @@ AUDIO_DTYPE = "float32"
 CHUNK_DURATION_SEC = 0.03  # ~30ms chunk size for VAD processing (~480 samples at 16kHz)
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION_SEC)
 
-# VAD & Streaming settings (Silero VAD) - Option B: Streaming Draft & Revise
-VAD_SILENCE_THRESHOLD_SEC = 0.40  # Final segment close after ~0.40s silence
-VAD_MAX_SEGMENT_SEC = 5.0         # Maximum segment length ~5.0s
-VAD_PADDING_SEC = 0.20            # Keep ~0.20s padding
+# VAD & Streaming settings (Silero VAD) - Adaptive Soft-Cut & Draft
+VAD_SILENCE_THRESHOLD_SEC = 0.40  # Standard silence duration to close segment (< 4.0s)
+VAD_SOFT_MAX_SEC = 4.0            # Speech duration threshold where adaptive silence kicks in
+VAD_HARD_MAX_SEC = 6.0            # Hard ceiling max segment duration before forced cut
+VAD_MICRO_PAUSE_SEC = 0.15        # Micro-pause threshold (breath/clause boundary) for soft-cut in [4.0s, 6.0s]
+VAD_PADDING_SEC = 0.20            # Keep ~0.20s padding before speech
 VAD_MIN_SEGMENT_SEC = 0.40        # Minimum speech duration for final commit
 VAD_THRESHOLD = 0.5               # Speech probability threshold
 
@@ -23,7 +26,11 @@ DRAFT_INTERVAL_SEC = 0.85         # Emit live translation draft every ~0.85s dur
 MIN_DRAFT_AUDIO_SEC = 0.65        # Require at least 0.65s audio before emitting the first draft
 
 # ASR settings (faster-whisper)
-ASR_MODEL_NAME = "large-v3"       # Alternative: "kotoba-tech/kotoba-whisper-v2.0-faster"
+# Options:
+# - "large-v3": Maximum accuracy (32 decoder layers)
+# - "kotoba-tech/kotoba-whisper-v2.0-faster": Japanese distil model, ultra fast (4 decoder layers)
+# - "deepdml/faster-whisper-large-v3-turbo-ct2": Whisper Turbo, 3-4x faster than large-v3
+ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "large-v3")
 ASR_DEVICE = "cuda"
 ASR_COMPUTE_TYPE = "float16"
 ASR_LANGUAGE = "ja"
@@ -38,10 +45,12 @@ ASR_MAX_NO_SPEECH_PROB = 0.6
 ASR_MIN_AVG_LOGPROB = -1.0
 
 # Translation settings (Local llama.cpp / llama-server or OpenAI-compatible endpoint)
-LOCAL_LLM_URL = "http://localhost:9090/v1/chat/completions"  # Local llama-server endpoint
+LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:9090/v1/chat/completions")
 TRANSLATION_MODEL = "default"                                # Model loaded in llama-server
-TRANSLATION_TIMEOUT_SEC = 5.0
+TRANSLATION_TIMEOUT_SEC = 5.0                                # Timeout for final commit translation
+TRANSLATION_TIMEOUT_DRAFT_SEC = 1.5                          # Short timeout for draft to prevent queue blockage
 TRANSLATION_MAX_TOKENS = 120
+TRANSLATION_MAX_TOKENS_DRAFT = 60
 
 # Subtitle overlay settings
 SUBTITLE_CLEAR_DELAY_SEC = 6.0

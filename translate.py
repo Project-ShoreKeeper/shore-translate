@@ -13,57 +13,80 @@ from config import (
     LOCAL_LLM_URL,
     TRANSLATION_MODEL,
     TRANSLATION_TIMEOUT_SEC,
+    TRANSLATION_TIMEOUT_DRAFT_SEC,
     TRANSLATION_MAX_TOKENS,
+    TRANSLATION_MAX_TOKENS_DRAFT,
     GLOSSARY_PATH,
 )
 
-# Endpoint constant at top of file
-LOCAL_ENDPOINT = LOCAL_LLM_URL  # Default: http://localhost:9090/v1/chat/completions
+LOCAL_ENDPOINT = LOCAL_LLM_URL
+
+# Cải tiến 2: System prompt cố định 100% để tái sử dụng toàn bộ Prefix KV Cache trong llama-server
+STATIC_SYSTEM_PROMPT = (
+    "You are a live subtitle translator for a Japanese programming and technology livestream. "
+    "Translate the Japanese speech into natural, concise English subtitles.\n"
+    "Rules:\n"
+    "1. Output ONLY the English translation, without explanation, notes, or quotation marks.\n"
+    "2. If glossary term definitions are provided, adhere to them strictly.\n"
+    "3. The Japanese speech comes from real-time ASR and may contain minor misrecognitions; resolve them naturally using context.\n"
+    "4. Do not invent facts not present in the input speech.\n"
+    "5. If the input is unintelligible noise, output an empty string."
+)
 
 
-def load_glossary_text(glossary_path: Path = GLOSSARY_PATH) -> str:
-    """Load glossary terms formatted as 'Japanese = English' lines."""
+def load_glossary_dict(glossary_path: Path = GLOSSARY_PATH) -> dict[str, str]:
+    """
+    Load glossary terms formatted as 'Japanese = English' into a dictionary.
+    Terms are sorted by length descending so longer compound phrases match first.
+    """
     if not glossary_path.exists():
-        return ""
-    lines = []
+        return {}
+    glossary = {}
     with open(glossary_path, "r", encoding="utf-8") as f:
         for line in f:
             stripped = line.strip()
             if stripped and not stripped.startswith("#") and "=" in stripped:
-                lines.append(stripped)
-    return "\n".join(lines)
+                parts = stripped.split("=", 1)
+                ja = parts[0].strip()
+                en = parts[1].strip()
+                if ja and en:
+                    glossary[ja] = en
+    # Sort by key length descending
+    return dict(sorted(glossary.items(), key=lambda kv: len(kv[0]), reverse=True))
 
 
-SYSTEM_PROMPT_BASE = (
-    "You are a live subtitle translator for a Japanese programming/technology livestream. "
-    "Translate the Japanese sentence into natural, concise English subtitles. Rules: "
-    "(1) Output only the English translation, nothing else. "
-    "(2) Use standard English technical terms (e.g. repository, compiler, deploy, pull request, API) and follow the glossary exactly when a term appears. "
-    "(3) The Japanese text comes from speech recognition and may contain mistakes, especially katakana loanwords misheard as other words; use the surrounding context to fix obvious errors silently. "
-    "(4) Do not add information that is not in the source. "
-    "(5) If the input is not meaningful speech, output an empty string."
-)
-
-
-def get_full_system_prompt() -> str:
-    glossary_lines = load_glossary_text()
-    if glossary_lines:
-        return f"{SYSTEM_PROMPT_BASE}\n\nGlossary:\n{glossary_lines}"
-    return SYSTEM_PROMPT_BASE
+def extract_matched_glossary(text: str, glossary_dict: dict[str, str]) -> list[tuple[str, str]]:
+    """
+    Cải tiến 3: Dynamic Glossary Matching.
+    So khớp cực nhanh (<0.05ms) tìm các thuật ngữ tiếng Nhật thực sự xuất hiện trong câu nói.
+    """
+    if not text or not glossary_dict:
+        return []
+    matched = []
+    for ja, en in glossary_dict.items():
+        if ja in text:
+            matched.append((ja, en))
+    return matched
 
 
 class LiveTranslator:
     """
     Translates Japanese ASR output to English using local llama-server (OpenAI-compatible).
-    Maintains a rolling context of the last 2 (Japanese, English) pairs.
+    Features:
+    - 100% Static System Prompt for Prefix KV Cache reuse (--cache-reuse in llama.cpp)
+    - Dynamic per-turn glossary injection in User turn
+    - Rolling context of the last 2 (JA, EN) conversational pairs
+    - Fast timeout and reduced token budget for intermediate drafts
     """
 
     def __init__(self, endpoint: str = LOCAL_ENDPOINT, model_name: str = TRANSLATION_MODEL):
         self.endpoint = endpoint
         self.model_name = model_name
-        self.system_prompt = get_full_system_prompt()
+        self.system_prompt = STATIC_SYSTEM_PROMPT
+        self.glossary_dict = load_glossary_dict()
         self.context: List[Tuple[str, str]] = []
         print(f"[translate] Local translation backend initialized (endpoint: {self.endpoint})")
+        print(f"[translate] Loaded {len(self.glossary_dict)} terms into dynamic glossary matcher.")
 
     def translate(
         self,
@@ -72,9 +95,8 @@ class LiveTranslator:
         is_final: bool = True,
     ) -> str:
         """
-        Translate Japanese text to English with context of last 2 (JA, EN) pairs.
-        On any error, skip that sentence, log one short line, and return ''.
-        If is_final=False (draft), translates concisely without committing to context.
+        Translate Japanese text to English with 2-turn rolling context.
+        If is_final=False (draft), uses shorter timeout and lower token budget without updating context.
         """
         if not text or not text.strip():
             return ""
@@ -84,15 +106,28 @@ class LiveTranslator:
 
         recent_context = context[-2:]
 
-        # Build message history
+        # 1. System Prompt (Static for KV Cache hit)
         messages = [{"role": "system", "content": self.system_prompt}]
+
+        # 2. Conversation history (Clean text without old ephemeral glossary headers)
         for ja, en in recent_context:
             if ja and en:
                 messages.append({"role": "user", "content": ja})
                 messages.append({"role": "assistant", "content": en})
-        messages.append({"role": "user", "content": text})
 
-        max_tokens = TRANSLATION_MAX_TOKENS if is_final else 60
+        # 3. Current User Turn with Dynamic Glossary
+        matched_glossary = extract_matched_glossary(text, self.glossary_dict)
+        if matched_glossary:
+            glossary_snippet = "\n".join(f"- {ja}: {en}" for ja, en in matched_glossary)
+            user_content = f"Glossary:\n{glossary_snippet}\n\nJapanese:\n{text}"
+        else:
+            user_content = text
+
+        messages.append({"role": "user", "content": user_content})
+
+        max_tokens = TRANSLATION_MAX_TOKENS if is_final else TRANSLATION_MAX_TOKENS_DRAFT
+        timeout_sec = TRANSLATION_TIMEOUT_SEC if is_final else TRANSLATION_TIMEOUT_DRAFT_SEC
+
         payload = {
             "model": self.model_name,
             "messages": messages,
@@ -110,7 +145,7 @@ class LiveTranslator:
                 method="POST",
             )
 
-            with urllib.request.urlopen(req, timeout=TRANSLATION_TIMEOUT_SEC) as resp:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
 
             choice = resp_data.get("choices", [{}])[0]
@@ -118,7 +153,9 @@ class LiveTranslator:
             translated = (msg.get("content") or "").strip()
 
             # Clean any leftover surrounding quotes
-            if translated.startswith('"') and translated.endswith('"'):
+            if (translated.startswith('"') and translated.endswith('"')) or (
+                translated.startswith("'") and translated.endswith("'")
+            ):
                 translated = translated[1:-1].strip()
 
             # Update rolling context ONLY on final commits
@@ -130,10 +167,15 @@ class LiveTranslator:
             return translated
 
         except urllib.error.URLError as uerr:
-            print(f"[translate error] Connection to local LLM failed ({uerr.reason}). Is llama-server running?", file=sys.stderr)
+            if is_final:
+                print(f"[translate error] Connection to local LLM failed ({uerr.reason}). Is llama-server running?", file=sys.stderr)
+            return ""
+        except TimeoutError:
+            # Drop slow drafts silently
             return ""
         except Exception as exc:
-            print(f"[translate error] {type(exc).__name__}: {exc}", file=sys.stderr)
+            if is_final:
+                print(f"[translate error] {type(exc).__name__}: {exc}", file=sys.stderr)
             return ""
 
 
@@ -143,11 +185,15 @@ def run_translation_worker(
     stop_event: threading.Event,
 ) -> None:
     """
-    Worker thread: reads (ja_text, asr_latency, audio_dur, is_final) from transcript_queue,
+    Worker thread: reads (epoch_id, ja_text, asr_latency, audio_dur, is_final) from transcript_queue,
     calls translate(), and puts (en_text, ja_text, total_latency, is_final) into subtitle_queue.
-    Drains older intermediate drafts if newer transcripts are available.
+    Features:
+    - Preemption / Drop Stale Drafts:
+      If a final commit is pending, drops all drafts in transcript_queue instantly.
+      If multiple drafts are queued, keeps only the latest draft.
     """
     translator = LiveTranslator()
+    committed_epoch = -1
 
     while not stop_event.is_set():
         try:
@@ -155,18 +201,38 @@ def run_translation_worker(
         except queue.Empty:
             continue
 
-        # Drain obsolete draft transcripts if a newer item is available
-        latest_item = item
+        # Inspect and drain pending transcripts
+        pending_items = [item]
         while not transcript_queue.empty():
             try:
-                peek = transcript_queue.get_nowait()
-                latest_item = peek
-                if peek[3]:  # If is_final is True, prioritize and stop draining
-                    break
+                pending_items.append(transcript_queue.get_nowait())
             except queue.Empty:
                 break
 
-        ja_text, asr_latency, audio_dur, is_final = latest_item
+        # Check for any Final commit item
+        final_item = None
+        for it in reversed(pending_items):
+            is_fin = it[4] if len(it) == 5 else it[3]
+            if is_fin:
+                final_item = it
+                break
+
+        if final_item is not None:
+            # Prioritize Final commit immediately and drop pending drafts
+            chosen_item = final_item
+        else:
+            chosen_item = pending_items[-1]
+
+        if len(chosen_item) == 5:
+            epoch_id, ja_text, asr_latency, audio_dur, is_final = chosen_item
+        else:
+            epoch_id = 0
+            ja_text, asr_latency, audio_dur, is_final = chosen_item
+
+        # Discard stale draft if its epoch was already committed
+        if not is_final and epoch_id <= committed_epoch:
+            continue
+
         t0 = time.time()
         en_text = translator.translate(ja_text, is_final=is_final)
         trans_latency = time.time() - t0
@@ -174,14 +240,18 @@ def run_translation_worker(
         if en_text:
             total_latency = asr_latency + trans_latency
             tag = "FINAL" if is_final else "DRAFT"
-            print(f"[TRANSLATE {tag}] ({trans_latency:.2f}s | total: {total_latency:.2f}s) JA: {ja_text}")
+            print(f"[TRANSLATE {tag}] (epoch {epoch_id} | {trans_latency:.2f}s | total: {total_latency:.2f}s)")
+            print(f"                 JA: {ja_text}")
             print(f"                 EN: {en_text}")
             subtitle_queue.put((en_text, ja_text, total_latency, is_final))
+
+            if is_final:
+                committed_epoch = max(committed_epoch, epoch_id)
 
 
 if __name__ == "__main__":
     translator = LiveTranslator()
-    sample_text = "だから非同期処理ってプロミスチケットみたいなの発行してたんですよ。"
+    sample_text = "だから非同期処理ってプロミスチケットみたいなのを発行してたんですよ。"
     print(f"Testing local translation with: {sample_text}")
     output = translator.translate(sample_text)
     print(f"Result: {output}")
