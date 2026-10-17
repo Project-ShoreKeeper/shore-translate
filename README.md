@@ -30,7 +30,7 @@ Floating Overlay (PySide6 GUI)
 ```
 
 ### Key Highlights
-- **Zero Cloud API Keys**: Translation runs on your local `llama-server` (baseline: **Qwen2.5-7B-Instruct** on port `9090`).
+- **Zero Cloud API Keys**: Translation runs on your local `llama-server` (baseline: **Qwen3-8B** on port `9090`).
 - **Streaming Draft & Revise**: Live partial translations update every ~0.85s (in amber italic) as the streamer speaks, then instantly lock in with high-precision translation (in white bold) when a sentence completes.
 - **Drop Stale Drafts & Preemption**: When a Final Commit occurs, all pending intermediate drafts are purged instantly from queues and dropped by workers, ensuring zero queue lag for final subtitles.
 - **Adaptive Soft-Cut VAD**: Rather than cutting speech rigidly at 5.0s, speech between 4.0s and 6.0s dynamically uses an ultra-sensitive 0.15s micro-pause threshold to cleanly cut between clauses (e.g. 〜て、〜けど) without slicing Japanese words in half.
@@ -48,7 +48,7 @@ Floating Overlay (PySide6 GUI)
 - **OS**: Linux (tested on Ubuntu 26.04 LTS / PipeWire / Wayland / X11)
 - **Python**: 3.10+
 - **GPU**: NVIDIA GPU with CUDA support (e.g. RTX 5060 Ti / RTX 4070+ with 12-16 GB VRAM)
-- **Local Model Server**: `llama-server` running on `http://localhost:9090` (baseline: Qwen2.5-7B)
+- **Local Model Server**: `llama-server` running on `http://localhost:9090` (baseline: Qwen3-8B)
 
 ---
 
@@ -57,9 +57,9 @@ Floating Overlay (PySide6 GUI)
 ### 1. Start the Local Translation Server
 In a separate terminal or as a service, start your local `llama-server` with the baseline model:
 ```bash
-/mnt/external_ssd/start_llama_server.sh qwen-7b
+/mnt/external_ssd/start_llama_server.sh qwen3-8b
 ```
-*(Baseline: `qwen-7b` (Qwen2.5-7B-Instruct Q4_K_M) is the primary baseline model, delivering accurate technical translation, natural conversational fluency, and strict glossary adherence. Alternatives: `qwen-3b` / `cat-1.4b` for ultra-low latency (~100ms) or `gemma-12b` for nuanced expressions).*
+*(Baseline: `qwen3-8b` (Qwen3-8B Q4_K_M) is the primary baseline model, trained on 36T tokens with next-gen multilingual fluency, superior Japanese nuance, and instant response times. Alternatives: `qwen-7b`, `qwen-3b` / `cat-1.4b` for ultra-low latency, or `gemma-12b`).*
 
 ### 2. Install Dependencies
 ```bash
