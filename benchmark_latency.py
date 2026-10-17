@@ -73,9 +73,12 @@ def run_benchmark(sample_wav: str = "sample_japanese_speech.wav"):
             print("    - ASR Result: [Filtered / Empty]")
             continue
 
-        ja_text, _ = asr_result
+        ja_text = asr_result[0]
+        meta = asr_result[2] if len(asr_result) > 2 else {}
+        avg_lp = meta.get("avg_logprob", 0.0)
+        dot = "🟢" if avg_lp > -0.35 else ("🟡" if avg_lp > -0.65 else "🔴")
         matched = extract_matched_glossary(ja_text, translator.glossary_dict)
-        print(f"    - Japanese Transcript: \"{ja_text}\"")
+        print(f"    - Japanese Transcript [{dot}]: \"{ja_text}\" (avg_logprob: {avg_lp:.2f})")
         if matched:
             print(f"    - Matched Dynamic Glossary: {matched}")
         print(f"    - ASR Inference Latency: {asr_latency:.3f} s (RTF: {asr_latency / seg_dur:.2f}x)")

@@ -17,12 +17,16 @@ from config import (
     TRANSLATION_MAX_TOKENS,
     TRANSLATION_MAX_TOKENS_DRAFT,
     GLOSSARY_PATH,
+    ENABLE_LLM_ASR_CRITIC,
+    ENABLE_ASR_TELEMETRY,
+    LOW_CONF_THRESHOLD,
+    HIGH_CONF_THRESHOLD,
 )
 
 LOCAL_ENDPOINT = LOCAL_LLM_URL
 
 # Cải tiến 2: System prompt cố định 100% để tái sử dụng toàn bộ Prefix KV Cache trong llama-server
-STATIC_SYSTEM_PROMPT = (
+BASE_SYSTEM_PROMPT = (
     "You are a live subtitle translator for a Japanese programming and technology livestream. "
     "Translate the Japanese speech into natural, concise English subtitles.\n"
     "Rules:\n"
@@ -32,6 +36,17 @@ STATIC_SYSTEM_PROMPT = (
     "4. Do not invent facts not present in the input speech.\n"
     "5. If the input is unintelligible noise, output an empty string."
 )
+
+# LLM "Homophone & Broken ASR" Critic
+if ENABLE_LLM_ASR_CRITIC:
+    STATIC_SYSTEM_PROMPT = (
+        f"{BASE_SYSTEM_PROMPT}\n"
+        "6. If the input Japanese ASR text appears severely cut-off, grammatically broken, "
+        "or contains obvious homophone transcription errors given the 2-turn conversation context and glossary, "
+        "append ' [⚠️ASR?]' at the very end of your English translation."
+    )
+else:
+    STATIC_SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
 
 
 def load_glossary_dict(glossary_path: Path = GLOSSARY_PATH) -> dict[str, str]:
@@ -77,6 +92,7 @@ class LiveTranslator:
     - Dynamic per-turn glossary injection in User turn
     - Rolling context of the last 2 (JA, EN) conversational pairs
     - Fast timeout and reduced token budget for intermediate drafts
+    - LLM Critic mode support (flags [⚠️ASR?])
     """
 
     def __init__(self, endpoint: str = LOCAL_ENDPOINT, model_name: str = TRANSLATION_MODEL):
@@ -171,11 +187,48 @@ class LiveTranslator:
                 print(f"[translate error] Connection to local LLM failed ({uerr.reason}). Is llama-server running?", file=sys.stderr)
             return ""
         except TimeoutError:
-            # Drop slow drafts silently
             return ""
         except Exception as exc:
             if is_final:
                 print(f"[translate error] {type(exc).__name__}: {exc}", file=sys.stderr)
+            return ""
+
+    def translate_en_to_ja(self, en_text: str) -> str:
+        """Translate English text to natural technical Japanese (used for synthetic test generation)."""
+        if not en_text or not en_text.strip():
+            return ""
+        prompt = (
+            "You are an expert technical translator. Translate the following English sentence "
+            "into natural, concise Japanese as spoken by a Japanese software developer or streamer. "
+            "Adhere strictly to standard Japanese IT terms and loanwords. "
+            "Output ONLY the Japanese translation, without quotes or explanation."
+        )
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": en_text},
+        ]
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": 120,
+            "temperature": 0.1,
+            "stream": False,
+        }
+        try:
+            req_data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                self.endpoint,
+                data=req_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=TRANSLATION_TIMEOUT_SEC) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+            choice = resp_data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            return (msg.get("content") or "").strip().strip('"').strip("'")
+        except Exception as exc:
+            print(f"[translate_en_to_ja error] {exc}", file=sys.stderr)
             return ""
 
 
@@ -185,12 +238,11 @@ def run_translation_worker(
     stop_event: threading.Event,
 ) -> None:
     """
-    Worker thread: reads (epoch_id, ja_text, asr_latency, audio_dur, is_final) from transcript_queue,
-    calls translate(), and puts (en_text, ja_text, total_latency, is_final) into subtitle_queue.
+    Worker thread: reads (epoch_id, ja_text, asr_latency, audio_dur, is_final, meta) from transcript_queue,
+    calls translate(), and puts (en_text, ja_text, total_latency, is_final, meta) into subtitle_queue.
     Features:
-    - Preemption / Drop Stale Drafts:
-      If a final commit is pending, drops all drafts in transcript_queue instantly.
-      If multiple drafts are queued, keeps only the latest draft.
+    - Preemption / Drop Stale Drafts
+    - Telemetry logging with traffic light indicator
     """
     translator = LiveTranslator()
     committed_epoch = -1
@@ -212,18 +264,21 @@ def run_translation_worker(
         # Check for any Final commit item
         final_item = None
         for it in reversed(pending_items):
-            is_fin = it[4] if len(it) == 5 else it[3]
+            # Check is_final flag
+            is_fin = it[4] if len(it) >= 5 else it[3]
             if is_fin:
                 final_item = it
                 break
 
         if final_item is not None:
-            # Prioritize Final commit immediately and drop pending drafts
             chosen_item = final_item
         else:
             chosen_item = pending_items[-1]
 
-        if len(chosen_item) == 5:
+        meta = {}
+        if len(chosen_item) >= 6:
+            epoch_id, ja_text, asr_latency, audio_dur, is_final, meta = chosen_item[:6]
+        elif len(chosen_item) == 5:
             epoch_id, ja_text, asr_latency, audio_dur, is_final = chosen_item
         else:
             epoch_id = 0
@@ -240,10 +295,16 @@ def run_translation_worker(
         if en_text:
             total_latency = asr_latency + trans_latency
             tag = "FINAL" if is_final else "DRAFT"
-            print(f"[TRANSLATE {tag}] (epoch {epoch_id} | {trans_latency:.2f}s | total: {total_latency:.2f}s)")
+            avg_lp = meta.get("avg_logprob", 0.0)
+            if ENABLE_ASR_TELEMETRY:
+                dot = "🟢" if avg_lp > HIGH_CONF_THRESHOLD else ("🟡" if avg_lp > LOW_CONF_THRESHOLD else "🔴")
+                print(f"[TRANSLATE {tag} {dot}] (epoch {epoch_id} | logprob: {avg_lp:.2f} | {trans_latency:.2f}s | total: {total_latency:.2f}s)")
+            else:
+                print(f"[TRANSLATE {tag}] (epoch {epoch_id} | {trans_latency:.2f}s | total: {total_latency:.2f}s)")
+
             print(f"                 JA: {ja_text}")
             print(f"                 EN: {en_text}")
-            subtitle_queue.put((en_text, ja_text, total_latency, is_final))
+            subtitle_queue.put((en_text, ja_text, total_latency, is_final, meta))
 
             if is_final:
                 committed_epoch = max(committed_epoch, epoch_id)

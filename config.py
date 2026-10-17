@@ -4,6 +4,7 @@ from pathlib import Path
 # Paths
 BASE_DIR = Path(__file__).resolve().parent
 GLOSSARY_PATH = BASE_DIR / "glossary.txt"
+DEBUG_ASR_DIR = BASE_DIR / "debug_asr"
 
 # Audio capture
 SAMPLE_RATE = 16000
@@ -43,6 +44,13 @@ ASR_VAD_FILTER = True
 ASR_MIN_CHAR_LENGTH = 2
 ASR_MAX_NO_SPEECH_PROB = 0.6
 ASR_MIN_AVG_LOGPROB = -1.0
+
+# ASR Verification & Telemetry Suite
+ENABLE_ASR_TELEMETRY = os.environ.get("ENABLE_ASR_TELEMETRY", "true").lower() in ("true", "1", "yes")
+ENABLE_LLM_ASR_CRITIC = os.environ.get("ENABLE_LLM_ASR_CRITIC", "false").lower() in ("true", "1", "yes")
+DEBUG_SAVE_LOW_CONF_AUDIO = os.environ.get("DEBUG_SAVE_LOW_CONF_AUDIO", "false").lower() in ("true", "1", "yes")
+LOW_CONF_THRESHOLD = -0.65
+HIGH_CONF_THRESHOLD = -0.35
 
 # Translation settings (Local llama.cpp / llama-server or OpenAI-compatible endpoint)
 LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:9090/v1/chat/completions")

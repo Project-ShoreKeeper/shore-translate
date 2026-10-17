@@ -59,7 +59,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
 )
 
-from config import SUBTITLE_CLEAR_DELAY_SEC, OVERLAY_MAX_LINES
+from config import (
+    SUBTITLE_CLEAR_DELAY_SEC,
+    OVERLAY_MAX_LINES,
+    ENABLE_ASR_TELEMETRY,
+    LOW_CONF_THRESHOLD,
+    HIGH_CONF_THRESHOLD,
+)
 
 
 class OutlinedSubtitleWidget(QWidget):
@@ -299,13 +305,29 @@ class SubtitleOverlay(QWidget):
             y = screen_geo.height() - self.height() - 90
             self.move(x, y)
 
-    def set_subtitle(self, text: str, is_final: bool = True) -> None:
+    def set_subtitle(
+        self,
+        text: str,
+        is_final: bool = True,
+        meta: Optional[dict] = None,
+    ) -> None:
         """
         Update subtitle text.
         Live drafts render progressively with an ellipsis in italic amber.
         Final commits snap into solid crisp white and reset the clear timer.
+        If ENABLE_ASR_TELEMETRY is True, prepends a traffic light confidence dot (🟢/🟡/🔴).
         """
-        display_text = text if is_final else f"{text}…"
+        prefix = ""
+        if ENABLE_ASR_TELEMETRY and meta and "avg_logprob" in meta:
+            avg_lp = meta.get("avg_logprob", 0.0)
+            if avg_lp > HIGH_CONF_THRESHOLD:
+                prefix = "🟢 "
+            elif avg_lp > LOW_CONF_THRESHOLD:
+                prefix = "🟡 "
+            else:
+                prefix = "🔴 "
+
+        display_text = f"{prefix}{text}" if is_final else f"{prefix}{text}…"
         self._current_text = display_text
         self._last_update_ts = time.time()
         self.subtitle_widget.set_subtitle_text(display_text, is_draft=(not is_final))
@@ -327,14 +349,17 @@ class SubtitleOverlay(QWidget):
                 item = self.subtitle_queue.get_nowait()
             except queue.Empty:
                 break
-            if len(item) == 4:
+            meta = {}
+            if len(item) >= 5:
+                en_text, ja_text, latency, is_final, meta = item[:5]
+            elif len(item) == 4:
                 en_text, ja_text, latency, is_final = item
             else:
                 en_text, ja_text, latency = item
                 is_final = True
 
             if en_text:
-                self.set_subtitle(en_text, is_final=is_final)
+                self.set_subtitle(en_text, is_final=is_final, meta=meta)
 
     # Cross-platform dragging support (Wayland startSystemMove + X11 fallback)
     def handle_drag_start(self, event) -> None:

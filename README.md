@@ -77,6 +77,31 @@ python main.py
 
 ---
 
+## ASR Verification & Telemetry Suite (for Non-Japanese Speakers)
+
+If you cannot read or speak Japanese, you can monitor and verify transcription accuracy objectively via mathematical metrics, visual indicators, and English-based round-trip tests:
+
+### 1. Visual Traffic-Light Confidence Indicator (Overlay)
+Subtitles in [`overlay.py`](file:///mnt/external_ssd/ProjectShorekeeper/shore-translate/overlay.py) automatically display an ASR confidence dot:
+- `🟢` (`avg_logprob > -0.35`): High confidence (>95% acoustic clarity).
+- `🟡` (`-0.65 < avg_logprob <= -0.35`): Medium confidence (fast speech / minor slur).
+- `🔴` (`avg_logprob <= -0.65`): Low confidence (ASR guessing / noise / cut-off speech).
+
+### 2. Standalone Verification Suite (`test_asr_quality.py`)
+Run automated quality benchmarks:
+```bash
+# Mode 1: Roundtrip Synthetic Verification (Edge-TTS + Technical Glossary + CER)
+python test_asr_quality.py --mode roundtrip
+
+# Mode 2: A/B Model Comparison (Latency, VRAM, Logprob, Glossary Hits, English Translation)
+python test_asr_quality.py --mode compare-models --audio sample_japanese_speech.wav
+
+# Mode 3: Golden Reference Alignment (Human English Subtitles vs. Pipeline Subtitles)
+python test_asr_quality.py --mode golden-ref --audio sample_japanese_speech.wav --ref-en subtitles.srt
+```
+
+---
+
 ## Offline Benchmark & Testing
 
 You can benchmark latency across all stages (VAD, ASR, LLM) without playing live audio:
@@ -99,6 +124,7 @@ shore-translate/
   overlay.py                 # Frameless, draggable, always-on-top subtitle window
   config.py                  # Central configuration constants
   glossary.txt               # Editable technical term pairs (日本語 = English)
+  test_asr_quality.py        # Non-Japanese speaker ASR verification & telemetry CLI tool
   benchmark_latency.py       # Latency benchmark script for VAD, Whisper, and LLM
   sample_japanese_speech.wav # 16kHz test speech audio for offline verification
   requirements.txt           # Python dependencies (no torch, no external cloud SDKs)

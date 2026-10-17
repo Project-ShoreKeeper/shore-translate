@@ -33,8 +33,9 @@ env/
 env.bak/
 venv.bak/
 
-# Temporary audio test outputs
+# Temporary audio test outputs & diagnostic dumps
 sample_system_audio_*.wav
+debug_asr/
 
 # IDE & Editor files
 .vscode/

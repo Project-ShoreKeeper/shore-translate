@@ -1,15 +1,19 @@
 import re
+import os
 import sys
 import time
+import json
 import queue
 import threading
 from pathlib import Path
 from typing import Optional, Tuple
 import numpy as np
+import soundfile as sf
 import ctranslate2
 from faster_whisper import WhisperModel
 
 from config import (
+    SAMPLE_RATE,
     ASR_MODEL_NAME,
     ASR_DEVICE,
     ASR_COMPUTE_TYPE,
@@ -22,7 +26,66 @@ from config import (
     ASR_MAX_NO_SPEECH_PROB,
     ASR_MIN_AVG_LOGPROB,
     GLOSSARY_PATH,
+    ENABLE_ASR_TELEMETRY,
+    DEBUG_SAVE_LOW_CONF_AUDIO,
+    DEBUG_ASR_DIR,
+    LOW_CONF_THRESHOLD,
+    HIGH_CONF_THRESHOLD,
 )
+
+# Japanese script guard regexes
+HANGUL_RE = re.compile(r"[\uac00-\ud7af\u1100-\u11ff]")
+HIRAGANA_RE = re.compile(r"[\u3040-\u309f]")
+KATAKANA_RE = re.compile(r"[\u30a0-\u30ff]")
+
+
+def is_valid_japanese(text: str) -> bool:
+    """
+    Japanese Script Guard:
+    1. Verifies that output contains Hiragana or Katakana.
+    2. Rejects text containing Korean Hangul.
+    3. Rejects pure Latin or pure Chinese characters caused by Whisper language drift.
+    """
+    if not text or not text.strip():
+        return False
+    if HANGUL_RE.search(text):
+        return False
+    # Must contain at least one Hiragana or Katakana character
+    if not (HIRAGANA_RE.search(text) or KATAKANA_RE.search(text)):
+        return False
+    return True
+
+
+def dump_low_conf_audio(
+    audio_data: np.ndarray,
+    text: str,
+    latency: float,
+    meta: dict,
+) -> None:
+    """Save low-confidence audio chunks as .wav and .json for offline diagnostic inspection."""
+    try:
+        DEBUG_ASR_DIR.mkdir(parents=True, exist_ok=True)
+        ts_str = time.strftime("%Y%m%d_%H%M%S")
+        ms = int((time.time() % 1) * 1000)
+        avg_lp = meta.get("avg_logprob", 0.0)
+        lp_str = f"{avg_lp:+.2f}".replace(".", "p").replace("-", "m").replace("+", "p")
+        base_name = f"chunk_{ts_str}_{ms:03d}_{lp_str}"
+        wav_path = DEBUG_ASR_DIR / f"{base_name}.wav"
+        json_path = DEBUG_ASR_DIR / f"{base_name}.json"
+
+        sf.write(str(wav_path), audio_data, SAMPLE_RATE, subtype="FLOAT")
+        payload = {
+            "text": text,
+            "latency_sec": latency,
+            "audio_duration_sec": len(audio_data) / SAMPLE_RATE,
+            "timestamp": time.time(),
+            "telemetry": meta,
+        }
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(payload, jf, ensure_ascii=False, indent=2)
+        print(f"[asr telemetry] Low-confidence audio dumped to {wav_path} (logprob: {avg_lp:.3f})")
+    except Exception as exc:
+        print(f"[asr telemetry warning] Failed to dump debug audio: {exc}", file=sys.stderr)
 
 
 def load_glossary_terms(glossary_path: Path = GLOSSARY_PATH) -> list[str]:
@@ -99,10 +162,13 @@ def is_repetitive(text: str) -> bool:
 class WhisperASR:
     """
     ASR transcription engine powered by faster-whisper (CTranslate2 C++/CUDA backend).
+    Features:
+    - Japanese Script Guard (Hiragana/Katakana validation, Hangul/drift rejection)
+    - Full confidence telemetry (avg_logprob, no_speech_prob, compression_ratio, lang_prob)
+    - Low-confidence diagnostic audio dumper
     """
 
     def __init__(self, model_name: str = ASR_MODEL_NAME):
-        # Strict CUDA check as required: exit with clear error if unavailable
         cuda_count = ctranslate2.get_cuda_device_count()
         if cuda_count == 0 or ASR_DEVICE != "cuda":
             print(
@@ -130,10 +196,10 @@ class WhisperASR:
             self.hotwords = " ".join(self.ja_terms[:15]) if self.ja_terms else None
         print(f"[asr] Loaded {len(self.ja_terms)} glossary terms (initial_prompt active, hotwords={'enabled' if self.hotwords else 'disabled'}).")
 
-    def transcribe_segment(self, audio_data: np.ndarray) -> Optional[Tuple[str, float]]:
+    def transcribe_segment(self, audio_data: np.ndarray) -> Optional[Tuple[str, float, dict]]:
         """
         Transcribe a single 16kHz float32 audio segment.
-        Returns (text, latency_sec) if valid, or None if filtered/empty.
+        Returns (text, latency_sec, telemetry_dict) if valid, or None if filtered/empty.
         """
         t_start = time.time()
         audio_data = np.asarray(audio_data, dtype=np.float32)
@@ -151,21 +217,30 @@ class WhisperASR:
 
             segments, info = self.model.transcribe(audio_data, **kwargs)
 
-            # Aggregate segment texts and filter hallucinations
+            # Aggregate segment texts and compute weighted confidence metrics
             valid_texts = []
+            total_tokens = 0
+            total_logprob = 0.0
+            total_no_speech = 0.0
+            total_compression = 0.0
+            seg_count = 0
+
             for seg in segments:
+                seg_count += 1
+                total_no_speech += getattr(seg, "no_speech_prob", 0.0)
+                total_compression += getattr(seg, "compression_ratio", 1.0)
+
+                seg_tokens = len(seg.tokens) if hasattr(seg, "tokens") and seg.tokens else max(len(seg.text), 1)
+                total_logprob += seg.avg_logprob * seg_tokens
+                total_tokens += seg_tokens
+
                 text = seg.text.strip()
-                # Filter criteria from specifications:
-                # 1. Empty or shorter than 2 characters
                 if len(text) < ASR_MIN_CHAR_LENGTH:
                     continue
-                # 2. High no_speech_prob (> 0.6)
                 if seg.no_speech_prob > ASR_MAX_NO_SPEECH_PROB:
                     continue
-                # 3. Low avg_logprob (< -1.0)
                 if seg.avg_logprob < ASR_MIN_AVG_LOGPROB:
                     continue
-                # 4. Repetitive hallucination patterns
                 if is_repetitive(text):
                     continue
 
@@ -174,6 +249,21 @@ class WhisperASR:
             latency = time.time() - t_start
             full_text = " ".join(valid_texts).strip()
 
+            avg_logprob = (total_logprob / total_tokens) if total_tokens > 0 else -1.0
+            mean_no_speech = (total_no_speech / seg_count) if seg_count > 0 else 0.0
+            mean_compression = (total_compression / seg_count) if seg_count > 0 else 1.0
+            lang = getattr(info, "language", "ja")
+            lang_prob = getattr(info, "language_probability", 1.0)
+
+            meta = {
+                "avg_logprob": round(float(avg_logprob), 3),
+                "no_speech_prob": round(float(mean_no_speech), 3),
+                "compression_ratio": round(float(mean_compression), 3),
+                "lang": lang,
+                "lang_prob": round(float(lang_prob), 3),
+            }
+
+            # Filter hallucination & repetitive patterns
             if len(full_text) < ASR_MIN_CHAR_LENGTH or is_repetitive(full_text):
                 return None
             if full_text in KNOWN_HALLUCINATIONS:
@@ -181,7 +271,15 @@ class WhisperASR:
             if is_glossary_echo(full_text, self.ja_terms):
                 return None
 
-            return full_text, latency
+            # Japanese Script Guard (reject Hangul, pure Latin, or pure Chinese)
+            if not is_valid_japanese(full_text):
+                return None
+
+            # Low-confidence audio dump
+            if DEBUG_SAVE_LOW_CONF_AUDIO and avg_logprob < LOW_CONF_THRESHOLD:
+                dump_low_conf_audio(audio_data, full_text, latency, meta)
+
+            return full_text, latency, meta
 
         except Exception as exc:
             print(f"[asr] Transcription error: {exc}", file=sys.stderr)
@@ -195,11 +293,10 @@ def run_asr_worker(
 ) -> None:
     """
     Worker thread: reads speech segments from speech_queue, runs ASR,
-    and puts (epoch_id, text, latency_sec, audio_duration_sec, is_final) into transcript_queue.
+    and puts (epoch_id, text, latency_sec, audio_duration_sec, is_final, meta) into transcript_queue.
     Features:
-    - Preemption / Drop Stale Drafts:
-      If a final commit is pending or arrives, all previous drafts are instantly purged.
-      If multiple drafts are queued, older drafts are dropped in favor of the latest draft.
+    - Preemption / Drop Stale Drafts
+    - Telemetry logging with traffic light indicator (🟢/🟡/🔴)
     """
     asr = WhisperASR()
     committed_epoch = -1
@@ -227,10 +324,8 @@ def run_asr_worker(
                 break
 
         if final_item is not None:
-            # Drop all stale drafts and prioritize the Final commit immediately
             chosen_item = final_item
         else:
-            # Keep only the latest intermediate draft
             chosen_item = pending_items[-1]
 
         if len(chosen_item) == 4:
@@ -239,15 +334,17 @@ def run_asr_worker(
             epoch_id = 0
             audio_data, audio_duration, is_final = chosen_item
 
-        # If it's a draft belonging to an already committed or older epoch, skip without computing
+        # Discard stale draft
         if not is_final and epoch_id <= committed_epoch:
             continue
 
         result = asr.transcribe_segment(audio_data)
         if result is not None:
-            text, latency = result
+            text = result[0]
+            latency = result[1]
+            meta = result[2] if len(result) > 2 else {}
 
-            # If this was a draft, check if a Final item has arrived in the meantime
+            # If this was a draft, check if a Final item arrived while transcribing
             if not is_final and not speech_queue.empty():
                 has_final = False
                 temp_items = []
@@ -263,13 +360,17 @@ def run_asr_worker(
                     speech_queue.put(t)
 
                 if has_final:
-                    # Drop this stale draft transcript, do not forward to translation
                     continue
 
             tag = "FINAL" if is_final else "DRAFT"
-            print(f"[ASR {tag}] (epoch {epoch_id} | {audio_duration:.2f}s audio | {latency:.2f}s latency): {text}")
-            transcript_queue.put((epoch_id, text, latency, audio_duration, is_final))
+            avg_lp = meta.get("avg_logprob", 0.0)
+            if ENABLE_ASR_TELEMETRY:
+                dot = "🟢" if avg_lp > HIGH_CONF_THRESHOLD else ("🟡" if avg_lp > LOW_CONF_THRESHOLD else "🔴")
+                print(f"[ASR {tag} {dot}] (epoch {epoch_id} | logprob: {avg_lp:.2f} | no_speech: {meta.get('no_speech_prob', 0):.2f} | {audio_duration:.2f}s audio | {latency:.2f}s latency): {text}")
+            else:
+                print(f"[ASR {tag}] (epoch {epoch_id} | {audio_duration:.2f}s audio | {latency:.2f}s latency): {text}")
+
+            transcript_queue.put((epoch_id, text, latency, audio_duration, is_final, meta))
 
             if is_final:
                 committed_epoch = max(committed_epoch, epoch_id)
-

@@ -5,3 +5,4 @@ PySide6
 numpy
 scipy
 soundfile
+edge-tts
