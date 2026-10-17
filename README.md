@@ -26,7 +26,7 @@ Floating Overlay (PySide6 GUI)
 ```
 
 ### Key Highlights
-- **Zero Cloud API Keys**: Translation runs on your local `llama-server` (e.g. Qwen-3B, Gemma-12B on port `9090`).
+- **Zero Cloud API Keys**: Translation runs on your local `llama-server` (baseline: **Qwen2.5-7B-Instruct** on port `9090`).
 - **Streaming Draft & Revise**: Live partial translations update every ~0.85s (in amber italic) as the streamer speaks, then instantly lock in with high-precision translation (in white bold) when a sentence completes.
 - **Zero PyTorch Dependency**: Both VAD (ONNX Runtime) and ASR (CTranslate2) run on native C++ engines, avoiding GIL locks and PyTorch memory overhead.
 - **Hardware Optimized**: Fits comfortably inside 16 GB VRAM on NVIDIA RTX GPUs (Whisper ~3.9 GB + LLM ~4-10 GB = ~8-14 GB total).
@@ -41,18 +41,18 @@ Floating Overlay (PySide6 GUI)
 - **OS**: Linux (tested on Ubuntu 26.04 LTS / PipeWire / Wayland / X11)
 - **Python**: 3.10+
 - **GPU**: NVIDIA GPU with CUDA support (e.g. RTX 5060 Ti / RTX 4070+ with 12-16 GB VRAM)
-- **Local Model Server**: `llama-server` running on `http://localhost:9090`
+- **Local Model Server**: `llama-server` running on `http://localhost:9090` (baseline: Qwen2.5-7B)
 
 ---
 
 ## Quick Start
 
 ### 1. Start the Local Translation Server
-In a separate terminal or as a service, start your local `llama-server`:
+In a separate terminal or as a service, start your local `llama-server` with the baseline model:
 ```bash
-/mnt/external_ssd/start_llama_server.sh [qwen-3b|cat-1.4b|cat-3.3b|qwen-7b|gemma-12b]
+/mnt/external_ssd/start_llama_server.sh qwen-7b
 ```
-*(Default: `qwen-3b` for ultra-fast ~100ms translation responses, low VRAM footprint, and strict technical glossary adherence. Use `cat-1.4b` for maximum throughput or `cat-3.3b` / `qwen-7b` for higher translation nuance).*
+*(Baseline: `qwen-7b` (Qwen2.5-7B-Instruct Q4_K_M) is the primary baseline model, delivering accurate technical translation, natural conversational fluency, and strict glossary adherence. Alternatives: `qwen-3b` / `cat-1.4b` for ultra-low latency (~100ms) or `gemma-12b` for nuanced expressions).*
 
 ### 2. Install Dependencies
 ```bash
